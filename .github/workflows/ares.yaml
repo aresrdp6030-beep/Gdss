@@ -1,0 +1,235 @@
+name: ARES RDP v5
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey:
+        description: Tailscale Auth Key
+        required: true
+        type: string
+
+env:
+  ARES_USER: ARES-ADMIN
+  ARES_PASS: ${{ secrets.ARES_RDP_PASS || '' }}
+
+jobs:
+  ares_deploy:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
+    steps:
+    - name: Initialize ARES
+      run: |
+        $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*"
+        $pass = -join ((1..18) | ForEach {Get-Random -Maximum $chars.length | ForEach {$chars[$_]}})
+        echo "ARES_PASS=$pass" >> $env:GITHUB_ENV
+        
+        Write-Host "ARES RDP v5" -ForegroundColor Cyan
+
+    - name: Create ARES Structure
+      run: |
+        $paths = @(
+          "C:\ARES\Core",
+          "C:\ARES\Data",
+          "C:\ARES\Temp",
+          "C:\ARES\Config",
+          "C:\Users\ARES-ADMIN\Desktop",
+          "C:\Users\ARES-ADMIN\Documents",
+          "C:\Users\ARES-ADMIN\Downloads",
+          "C:\Users\ARES-ADMIN\AppData\Local\Google\Chrome\User Data\Default"
+        )
+        foreach ($p in $paths) {
+          New-Item -Path $p -ItemType Directory -Force | Out-Null
+        }
+
+    - name: Create ARES Admin
+      run: |
+        $secPass = ConvertTo-SecureString $env:ARES_PASS -AsPlainText -Force
+        if (-not (Get-LocalUser -Name "ARES-ADMIN" -ErrorAction SilentlyContinue)) {
+          New-LocalUser -Name "ARES-ADMIN" -Password $secPass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "ARES-ADMIN"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "ARES-ADMIN"
+          Add-LocalGroupMember -Group "Users" -Member "ARES-ADMIN"
+        }
+
+    - name: Restore ARES Cache
+      uses: actions/cache/restore@v4
+      id: ares_restore
+      with:
+        path: |
+          C:\Users\ARES-ADMIN\AppData\Local\Google\Chrome\User Data
+          C:\Users\ARES-ADMIN\Downloads
+          C:\ARES\Data
+          C:\Users\ARES-ADMIN\Documents
+          C:\Users\ARES-ADMIN\Desktop
+        key: ares-v5-${{ github.run_id }}
+        restore-keys: |
+          ares-v5-
+
+    - name: Install Chrome
+      run: |
+        $chromeUrl = "https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D%26iid%3D%7B00000000-0000-0000-0000-000000000000%7D%26lang%3Den%26browser%3D4%26usagestats%3D0%26appname%3DGoogle%2520Chrome%26needsadmin%3Dprefers/consumersetup.exe?product=Chrome&platform=win64"
+        $chromeInstaller = "$env:TEMP\chrome.exe"
+        
+        Invoke-WebRequest -Uri $chromeUrl -OutFile $chromeInstaller
+        Start-Process $chromeInstaller -ArgumentList "/silent", "/install" -Wait
+        
+        $chromePaths = @(
+          "C:\Program Files\Google\Chrome\Application\chrome.exe",
+          "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+        )
+        
+        $chromeFound = $false
+        foreach ($path in $chromePaths) {
+          if (Test-Path $path) {
+            $chromeFound = $true
+            $shortcutPath = "C:\Users\ARES-ADMIN\Desktop\Chrome.lnk"
+            $wsh = New-Object -ComObject WScript.Shell
+            $shortcut = $wsh.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = $path
+            $shortcut.Save()
+            break
+          }
+        }
+        
+        if (-not $chromeFound) {
+          $fallbackUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+          Invoke-WebRequest -Uri $fallbackUrl -OutFile $chromeInstaller
+          Start-Process $chromeInstaller -ArgumentList "/silent", "/install" -Wait
+        }
+
+    - name: Install Chrome Extensions
+      run: |
+        $extensions = @(
+          "cjpalhdlnbpafiamejdnhcphjbkeiagm",  # uBlock Origin
+          "nngceckbapebfimnlniiiahkandclclb",  # Bitwarden
+          "aapbdbdomjkkjkaonfhkkikfgjllcleb",  # Google Translate
+          "ghbmnnjooekpmoecnnnilnnbdlolhkhi"   # Google Drive
+        )
+        
+        $preferencesPath = "C:\Users\ARES-ADMIN\AppData\Local\Google\Chrome\User Data\Default\Preferences"
+        if (Test-Path $preferencesPath) {
+          foreach ($ext in $extensions) {
+            $extDir = "C:\Users\ARES-ADMIN\AppData\Local\Google\Chrome\User Data\Default\Extensions\$ext"
+            New-Item -Path $extDir -ItemType Directory -Force | Out-Null
+          }
+        }
+
+    - name: Install Tailscale
+      run: |
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $tsInstaller = "$env:TEMP\tailscale.msi"
+        
+        Invoke-WebRequest -Uri $tsUrl -OutFile $tsInstaller
+        Start-Process msiexec.exe -ArgumentList "/i", "`"$tsInstaller`"", "/quiet", "/norestart" -Wait
+        
+        Start-Sleep -Seconds 10
+        & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "ARES-$(Get-Random -Maximum 9999)" --accept-dns=false
+
+    - name: Configure RDP
+      run: |
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MinEncryptionLevel" -Value 1
+        
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        New-NetFirewallRule -DisplayName "ARES-RDP" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow
+
+    - name: Install Tools
+      run: |
+        $tools = @(
+          @{Name="7-Zip"; Url="https://www.7-zip.org/a/7z2409-x64.exe"},
+          @{Name="Notepad++"; Url="https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.6.5/npp.8.6.5.Installer.x64.exe"},
+          @{Name="WinSCP"; Url="https://downloads.sourceforge.net/project/winscp/WinSCP/6.3.3/WinSCP-6.3.3-Setup.exe"},
+          @{Name="VLC"; Url="https://get.videolan.org/vlc/3.0.20/win64/vlc-3.0.20-win64.exe"}
+        )
+        
+        foreach ($tool in $tools) {
+          $out = "C:\ARES\Temp\$($tool.Name).exe"
+          try {
+            Invoke-WebRequest -Uri $tool.Url -OutFile $out -TimeoutSec 30
+            Start-Process $out -ArgumentList "/S" -Wait -NoNewWindow
+          } catch {
+            Write-Host "."
+          }
+        }
+
+    - name: System Optimizations
+      run: |
+        powercfg -change -standby-timeout-ac 0
+        powercfg -change -disk-timeout-ac 0
+        powercfg -change -monitor-timeout-ac 0
+        
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power" -Name "HibernateEnabled" -Value 0
+        
+        Set-Service -Name "SysMain" -StartupType Disabled
+        Set-Service -Name "WSearch" -StartupType Disabled
+
+    - name: Display Connection Info
+      run: |
+        $retryCount = 0
+        $ip = $null
+        
+        while ($retryCount -lt 10 -and -not $ip) {
+          try {
+            $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1
+          } catch {
+            $ip = $null
+          }
+          if (-not $ip) {
+            Start-Sleep -Seconds 5
+            $retryCount++
+          }
+        }
+        
+        if (-not $ip) {
+          $ip = "Waiting for IP..."
+        }
+        
+        $info = @"
+╔════════════════════════════════╗
+║        ARES RDP v5             ║
+╠════════════════════════════════╣
+║ IP: $ip
+║ User: ARES-ADMIN
+║ Pass: $env:ARES_PASS
+║ Port: 3389
+║ Tools: Chrome, 7-Zip, Notepad++
+╚════════════════════════════════╝
+"@
+        
+        $info | Out-File -FilePath "C:\ARES\Core\access.txt" -Encoding UTF8
+        $info | Out-File -FilePath "C:\Users\ARES-ADMIN\Desktop\ARES-ACCESS.txt" -Encoding UTF8
+        Write-Host "::notice title=ARES ACCESS READY::$info"
+
+    - name: ARES Session
+      shell: powershell
+      run: |
+        Write-Host "ARES session active - 6 hours" -ForegroundColor Green
+        try {
+          $endTime = (Get-Date).AddHours(6)
+          while ((Get-Date) -lt $endTime) {
+            Start-Sleep -Seconds 60
+          }
+        } finally {
+          Write-Host "Saving ARES data..." -ForegroundColor Yellow
+        }
+
+    - name: Save ARES Cache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          C:\Users\ARES-ADMIN\AppData\Local\Google\Chrome\User Data
+          C:\Users\ARES-ADMIN\Downloads
+          C:\ARES\Data
+          C:\Users\ARES-ADMIN\Documents
+          C:\Users\ARES-ADMIN\Desktop
+        key: ares-v5-${{ github.run_id }}
+
+    - name: ARES Complete
+      if: always()
+      run: |
+        Write-Host "ARES v5 deployment complete" -ForegroundColor Cyan
+        Get-Date | Out-File "C:\ARES\Core\complete.txt"
